@@ -64,7 +64,7 @@ class CustodyStore:
                     case_id INTEGER NOT NULL REFERENCES cases(id), label TEXT NOT NULL,
                     filename TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
                     content BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'custody'
-                        CHECK(status IN ('custody','opened','released','derivative')),
+                        CHECK(status IN ('custody','opened','released','derivative','on_loan')),
                     current_custodian TEXT NOT NULL, legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0,1)),
                     retention_until TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL, UNIQUE(case_id,label)
@@ -72,7 +72,7 @@ class CustodyStore:
                 CREATE TABLE IF NOT EXISTS custody_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     evidence_id INTEGER NOT NULL REFERENCES evidence(id), sequence INTEGER NOT NULL,
-                    event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED')),
+                    event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED','LOAN_OUT','LOAN_RETURN')),
                     actor_id TEXT NOT NULL REFERENCES users(id), from_person TEXT,
                     to_person TEXT, location TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
                     previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL,
@@ -84,6 +84,22 @@ class CustodyStore:
                     child_evidence_id INTEGER NOT NULL UNIQUE REFERENCES evidence(id),
                     method TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL, UNIQUE(parent_evidence_id,child_evidence_id)
+                );
+                CREATE TABLE IF NOT EXISTS loans(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    case_id INTEGER NOT NULL REFERENCES cases(id),
+                    applicant_id TEXT NOT NULL REFERENCES users(id),
+                    borrower TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    due_date TEXT NOT NULL,
+                    original_custodian TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','active','returned')),
+                    decided_by TEXT REFERENCES users(id), decided_at TEXT,
+                    returned_by TEXT REFERENCES users(id), returned_at TEXT,
+                    return_location TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,6 +262,12 @@ class CustodyStore:
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
+            open_loan = self._open_loan(conn, evidence_id)
+            result["current_loan"] = self._loan_view(conn, open_loan) if open_loan else None
+            result["loan_history"] = [
+                self._loan_view(conn, x)
+                for x in conn.execute("SELECT * FROM loans WHERE evidence_id=? ORDER BY id", (evidence_id,)).fetchall()
+            ]
             if include_content:
                 result["content_b64"] = base64.b64encode(row["content"]).decode()
             return result
@@ -258,6 +280,9 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                if row["status"] == "on_loan":
+                    raise BusinessError("证据外借中，不能移交", 409, "loan_active")
+                self._assert_no_pending_loan(conn, evidence_id, "移交")
                 if row["status"] == "released":
                     raise BusinessError("已释放证据不能再移交", 409, "evidence_released")
                 self._append_event(conn, evidence_id, "TRANSFER", user_id, from_person=row["current_custodian"], to_person=to_person.strip(), location=location.strip(), note=note.strip())
@@ -276,6 +301,9 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                if row["status"] == "on_loan":
+                    raise BusinessError("证据外借中，不能开箱", 409, "loan_active")
+                self._assert_no_pending_loan(conn, evidence_id, "开箱")
                 if row["status"] != "custody":
                     raise BusinessError("只有处于封存保管状态的证据可以开箱", 409, "invalid_status")
                 self._append_event(conn, evidence_id, "OPEN", user_id, from_person=row["current_custodian"], location=location.strip(), note=note.strip())
@@ -299,6 +327,8 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 parent = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, parent["case_id"], user_id, {"analyst"})
+                if parent["status"] == "on_loan":
+                    raise BusinessError("证据外借中，不能分析派生", 409, "loan_active")
                 if parent["status"] != "opened":
                     raise BusinessError("原始证据必须先开箱才能分析", 409, "evidence_not_opened")
                 cur = conn.execute(
@@ -344,6 +374,9 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                if row["status"] == "on_loan":
+                    raise BusinessError("证据外借中，不能释放", 409, "loan_active")
+                self._assert_no_pending_loan(conn, evidence_id, "释放")
                 if row["legal_hold"]:
                     raise BusinessError("存在法律保留，禁止释放证据", 409, "legal_hold_active")
                 if row["status"] == "released":
@@ -352,6 +385,141 @@ class CustodyStore:
                 conn.execute("UPDATE evidence SET status='released' WHERE id=?", (evidence_id,))
                 self._audit(conn, row["case_id"], user_id, "evidence.release", {"evidence_id": evidence_id, "recipient": recipient.strip()})
                 return {"id": evidence_id, "status": "released", "recipient": recipient.strip()}
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _is_overdue(loan):
+        return (
+            loan["status"] == "active"
+            and date.fromisoformat(loan["due_date"]) < date.today()
+        )
+
+    def _loan_view(self, conn, loan):
+        data = dict(loan)
+        data["overdue"] = self._is_overdue(loan)
+        return data
+
+    def _open_loan(self, conn, evidence_id):
+        return conn.execute(
+            "SELECT * FROM loans WHERE evidence_id=? AND status IN ('pending','active') ORDER BY id DESC LIMIT 1",
+            (evidence_id,),
+        ).fetchone()
+
+    def _assert_no_pending_loan(self, conn, evidence_id, action):
+        loan = self._open_loan(conn, evidence_id)
+        if loan is not None and loan["status"] == "pending":
+            raise BusinessError(f"存在待审批的借阅申请，审批结束前不能{action}", 409, "loan_pending")
+
+    def apply_loan(self, user_id, evidence_id, borrower, purpose, due_date):
+        borrower, purpose = borrower.strip(), purpose.strip()
+        if not borrower:
+            raise BusinessError("借出对象不能为空", 422, "borrower_required")
+        if len(purpose) < 3:
+            raise BusinessError("借阅用途至少 3 字", 422, "purpose_required")
+        try:
+            deadline = date.fromisoformat(due_date)
+        except (ValueError, TypeError):
+            raise BusinessError("归还日期格式错误，应为 YYYY-MM-DD", 422, "invalid_due_date")
+        if deadline < date.today():
+            raise BusinessError("归还日期不能早于今天", 422, "invalid_due_date")
+        with self.connect() as conn:
+            row = self._evidence(conn, evidence_id)
+            self._member(conn, row["case_id"], user_id, {"custodian"})
+            open_loan = self._open_loan(conn, evidence_id)
+            if open_loan is not None:
+                if self._is_overdue(open_loan):
+                    raise BusinessError("外借已逾期且尚未处理，同一件证据不能再次申请", 409, "loan_overdue_open")
+                if open_loan["status"] == "pending":
+                    raise BusinessError("该证据已有待审批的借阅申请", 409, "loan_pending")
+                raise BusinessError("证据外借中，不能重复申请借阅", 409, "loan_active")
+            if row["status"] != "custody":
+                raise BusinessError("只有封存保管中的证据可以提交借阅", 409, "loan_not_in_custody")
+            cur = conn.execute(
+                """INSERT INTO loans(evidence_id,case_id,applicant_id,borrower,purpose,due_date,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (evidence_id, row["case_id"], user_id, borrower, purpose, due_date, now()),
+            )
+            loan_id = cur.lastrowid
+            self._audit(conn, row["case_id"], user_id, "loan.apply", {
+                "loan_id": loan_id, "evidence_id": evidence_id, "borrower": borrower, "due_date": due_date,
+            })
+            return {"id": loan_id, "evidence_id": evidence_id, "status": "pending",
+                    "borrower": borrower, "purpose": purpose, "due_date": due_date}
+
+    def approve_loan(self, user_id, loan_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                loan = conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
+                if not loan:
+                    raise BusinessError("借阅申请不存在", 404, "not_found")
+                case = self._case(conn, loan["case_id"])
+                if user_id != case["created_by"]:
+                    self._member(conn, loan["case_id"], user_id, {"auditor"})
+                if loan["status"] != "pending":
+                    raise BusinessError("只有待审批的借阅申请可以批准", 409, "loan_not_pending")
+                row = self._evidence(conn, loan["evidence_id"])
+                if row["status"] != "custody":
+                    raise BusinessError("证据已不在封存保管状态，借阅申请无法批准", 409, "loan_not_in_custody")
+                conn.execute(
+                    """UPDATE loans SET status='active',original_custodian=?,decided_by=?,decided_at=? WHERE id=?""",
+                    (row["current_custodian"], user_id, now(), loan_id),
+                )
+                conn.execute("UPDATE evidence SET status='on_loan',current_custodian=? WHERE id=?",
+                             (loan["borrower"], row["id"]))
+                self._append_event(
+                    conn, row["id"], "LOAN_OUT", user_id,
+                    from_person=row["current_custodian"], to_person=loan["borrower"],
+                    note=f"外借鉴定，到期归还日 {loan['due_date']}；用途：{loan['purpose']}",
+                )
+                self._audit(conn, row["case_id"], user_id, "loan.approve", {
+                    "loan_id": loan_id, "evidence_id": row["id"], "borrower": loan["borrower"],
+                    "due_date": loan["due_date"],
+                })
+                return {"id": loan_id, "evidence_id": row["id"], "status": "active",
+                        "borrower": loan["borrower"], "due_date": loan["due_date"],
+                        "original_custodian": row["current_custodian"]}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def return_loan(self, user_id, evidence_id, location, note=""):
+        if not location.strip():
+            raise BusinessError("归还位置不能为空", 422, "location_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                self._member(conn, row["case_id"], user_id, {"custodian"})
+                loan = self._open_loan(conn, evidence_id)
+                if loan is None or loan["status"] != "active":
+                    raise BusinessError("该证据没有进行中的外借", 409, "loan_not_active")
+                original_custodian = loan["original_custodian"] or row["created_by"]
+                was_overdue = self._is_overdue(loan)
+                conn.execute(
+                    "UPDATE loans SET status='returned',returned_by=?,returned_at=?,return_location=? WHERE id=?",
+                    (user_id, now(), location.strip(), loan["id"]),
+                )
+                conn.execute("UPDATE evidence SET status='custody',current_custodian=? WHERE id=?",
+                             (original_custodian, evidence_id))
+                overdue_note = "（逾期归还）" if was_overdue else ""
+                self._append_event(
+                    conn, evidence_id, "LOAN_RETURN", user_id,
+                    from_person=loan["borrower"], to_person=original_custodian,
+                    location=location.strip(),
+                    note=f"归还原件{overdue_note}：{note.strip()}".rstrip("："),
+                )
+                self._audit(conn, row["case_id"], user_id, "loan.return", {
+                    "loan_id": loan["id"], "evidence_id": evidence_id,
+                    "location": location.strip(), "was_overdue": was_overdue,
+                    "restored_custodian": original_custodian,
+                })
+                return {"id": evidence_id, "status": "custody",
+                        "current_custodian": original_custodian,
+                        "loan_id": loan["id"], "location": location.strip(),
+                        "was_overdue": was_overdue}
             except Exception:
                 conn.rollback()
                 raise
@@ -375,11 +543,15 @@ class CustodyStore:
                         chain_valid = False
                     expected_prev = e["event_hash"]
                 all_valid = all_valid and hash_valid and chain_valid
+                loans = conn.execute("SELECT * FROM loans WHERE evidence_id=? ORDER BY id", (row["id"],)).fetchall()
+                open_loan = next((x for x in loans if x["status"] in ("pending", "active")), None)
                 items.append({
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
                     "legal_hold": bool(row["legal_hold"]), "retention_until": row["retention_until"],
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
+                    "current_loan": self._loan_view(conn, open_loan) if open_loan else None,
+                    "loan_history": [self._loan_view(conn, x) for x in loans],
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
                 })
@@ -420,6 +592,8 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201,store.ingest_evidence(user,int(parts[2]),d.get("label",""),d.get("filename",""),d.get("content_b64",""),d.get("retention_until",""),d.get("custodian")))
         if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="report" and method=="GET":
             return self._send(200,store.report(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","loans"] and parts[3]=="approve" and method=="POST":
+            d=self._body(); return self._send(200,store.approve_loan(user,int(parts[2])))
         if len(parts)>=3 and parts[:2]==["api","evidence"]:
             evidence_id=int(parts[2])
             if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
@@ -430,6 +604,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[3]=="derive": return self._send(201,store.derive(user,evidence_id,d.get("method",""),d.get("label",""),d.get("filename",""),d.get("content_b64","")))
                 if parts[3]=="release": return self._send(200,store.release(user,evidence_id,d.get("recipient",""),d.get("note","")))
                 if parts[3]=="hold": return self._send(200,store.set_hold(user,evidence_id,bool(d.get("hold")),d.get("reason","")))
+                if parts[3]=="loan": return self._send(201,store.apply_loan(user,evidence_id,d.get("borrower",""),d.get("purpose",""),d.get("due_date","")))
+                if parts[3]=="return": return self._send(200,store.return_loan(user,evidence_id,d.get("location",""),d.get("note","")))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
